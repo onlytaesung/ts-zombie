@@ -1605,7 +1605,7 @@ function render() {
   if (window.curAudio && key !== 'voice.detail') { try { curAudio.pause(); } catch (_) { } }
   const wallScreen = U.locked || key === 'home.main';
   scr.classList.toggle('light-status', wallScreen || /^(clock\.|camera\.|gallery\.view|insta\.story|facetime\.call)/.test(key));
-  if (CALL && key !== 'phone.call' && key !== 'facetime.call' && key !== 'lock.call' && key !== 'lock.ftcall') stopCall();
+  if (CALL && key !== 'phone.call' && key !== 'facetime.call' && key !== 'lock.call' && key !== 'lock.ftcall' && key !== 'lock.incall') stopCall();
   const w = $('#wall');
   const img = U.locked ? S.wall.lock : S.wall.home;
   w.className = wallScreen ? (U.locked ? (U.pass ? 'wall-lock wblur' : 'wall-lock') : 'wall-home') : '';
@@ -3075,7 +3075,8 @@ function voiceSection(num, draw) {
 }
 /* move on to the next voice clip, or hang up after the last one */
 function nextClip(C, finish) {
-  if (!C.queue || C.qi >= C.queue.length - 1) return finish();
+  /* after the last clip the other person hangs up a moment later, not on the very last syllable */
+  if (!C.queue || C.qi >= C.queue.length - 1) { if (!C.tailT) C.tailT = setTimeout(() => { if (CALL === C) finish(); }, 1200); return; }
   if (C.advAt && Date.now() - C.advAt < 700) return;
   C.advAt = Date.now(); C.qi++;
   const el = C.media;
@@ -3119,6 +3120,24 @@ let CALL = null;
 /* the call's video starts (silently) inside the tap that places the call, so the browser lets its sound play later.
    only the video element itself makes sound (no second audio path), so it is never heard twice */
 let CALLAC = null;
+let SILENT_WAV = null;
+function silentWav() {
+  if (SILENT_WAV) return SILENT_WAV;
+  const n = 800, b = new Uint8Array(44 + n), v = new DataView(b.buffer), str = (o, t) => { for (let i = 0; i < t.length; i++) b[o + i] = t.charCodeAt(i); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true); str(36, 'data'); v.setUint32(40, n, true);
+  b.fill(128, 44); let bin = ''; b.forEach(x => bin += String.fromCharCode(x));
+  return (SILENT_WAV = 'data:audio/wav;base64,' + btoa(bin));
+}
+function unlockAudio(el, real) {
+  el.playsInline = true; el.setAttribute('playsinline', ''); el.preload = 'auto'; el.muted = false; el.volume = 1;
+  el.src = silentWav();
+  let done = false;
+  const go = () => { if (done) return; done = true; try { el.pause(); } catch (e) { } el.src = real; mediaFallback(el); try { el.load(); } catch (e) { } };
+  let pr = null; try { pr = el.play(); } catch (e) { }
+  if (pr && pr.then) pr.then(go, go); else go();
+  setTimeout(go, 600);
+}
 function primeMedia(el) {
   el.playsInline = true; el.setAttribute('playsinline', '');
   el.preload = 'auto'; el.muted = true; el.defaultMuted = false;
@@ -3209,8 +3228,14 @@ function beginCall(kind, p) {
   const C = CALL = { sid: p.sid, kind, num: p.num, started: NOW(), on: false, sec: 0, ended: false, ring: p.incoming ? 0.4 : (kind === 'ft' ? 3 : 2), incoming: !!p.incoming, mute: false, spk: false, cam: true, noAns };
   if (vq && vq.length > 1) { C.queue = vq; C.qi = 0; vq.forEach(v => ftFetch(v.src)); }
   if (src) {
-    C.media = kind === 'ft' ? h('video', { class: 'ftvid', preload: 'auto' }) : new Audio();
-    C.media.src = ftSrc(src.src); mediaFallback(C.media); C.media.loop = true; primeMedia(C.media);
+    if (kind === 'ft') {
+      C.media = h('video', { class: 'ftvid', preload: 'auto' });
+      C.media.src = ftSrc(src.src); mediaFallback(C.media); C.media.loop = true; primeMedia(C.media);
+    } else {
+      /* phones (iPhone especially) refuse to un-mute a sound later, so the call voice is unlocked inside the tap
+         with a moment of silence, never muted; the real voice then plays with sound when the call connects */
+      C.media = new Audio(); unlockAudio(C.media, ftSrc(src.src));
+    }
     /* it keeps looping silently while it rings, so a short clip never runs out before the call connects */
   }
   if (kind === 'ft') {
@@ -3240,7 +3265,7 @@ function runCall(C, paint, onEnd) {
       const ready = (() => { try { const b = C.media.buffered, d = isFinite(C.media.duration) ? C.media.duration : 4; return C.media.readyState >= 2 && b.length && b.start(0) <= 0.2 && b.end(0) >= Math.min(4, d - 0.2); } catch (e) { return true; } })();
       if (!ready && s < C.ring + 6) { paint(); return; }
       C.on = true; C.onAt = NOW();
-      C.media.loop = false;
+      C.media.loop = false; C.media.muted = false;
       C.media.onended = () => nextClip(C, finish);
       try { C.media.currentTime = 0; } catch (e) { }
       callSound(C.media, true);
@@ -5842,6 +5867,8 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
       h('button', { class: 'opt blue', text: '나중에', onclick: closeSheet })));
   }, 300);
 })();
+/* let sounds play even when the iPhone's silent switch is on (Safari 16.4+) */
+try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { }
 (function boot() {
   buildShell(); updateBar(); tick(); setInterval(tick, 1000);
   try {
